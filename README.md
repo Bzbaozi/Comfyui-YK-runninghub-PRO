@@ -132,3 +132,9 @@
 ---
 
 > Made with ❤️ for ComfyUI users.
+
+## 📄 许可证
+
+本项目采用 [MIT License](LICENSE)，允许自由使用、修改和分发。
+
+详见 [LICENSE](LICENSE) 文件。
