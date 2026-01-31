@@ -1,4 +1,5 @@
 # ComfyUI-YK-RunningHub-PRO  
+[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](https://opensource.org/licenses/MIT)  
 > **YK-影客AI 全能图片生成节点（支持社区版 / 全能Xinbao / 官方PRO 混合策略）**
 
 本节点提供 **批量图像到图像生成（Image-to-Image）** 能力，支持最多 **10 组任务并行处理**，每组可上传最多 3 张参考图 + 自定义提示词，并自动按 **稳定性优先策略** 调用不同后端 API。
