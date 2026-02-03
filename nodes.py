@@ -79,7 +79,7 @@ class RunningHubRhartImageToImageBatch10:
                     "min": 1,
                     "max": 10,
                     "step": 1,
-                    "tooltip": "全局最大并发组数（1～10）"
+                    "tooltip": "全局最大处理组数（仅处理前 N 个有效组，1～10）"
                 }),
                 "max_wait_time": ("INT", {
                     "default": 120,
@@ -88,12 +88,20 @@ class RunningHubRhartImageToImageBatch10:
                     "step": 30,
                     "tooltip": "每个子任务最大等待时间（秒），适用于所有API模式"
                 }),
+                # 👇【关键】全局提示词行数限制 —— 放在最后，UI 显示在底部 👇
+                "max_prompt_lines_global": ("INT", {
+                    "default": -1,
+                    "min": -1,
+                    "max": 50,
+                    "step": 1,
+                    "tooltip": "【全局】每组最多使用多少行提示词（-1 = 不限制）。例如设为5，则即使提示词有10行，每组也只生成前5个变体。此参数位于底部便于批量调试。"
+                }),
             },
             "optional": optional_inputs
         }
 
-    RETURN_TYPES = ("IMAGE",) * 10
-    RETURN_NAMES = tuple(f"输出_{i}" for i in range(1, 11))
+    RETURN_TYPES = ("IMAGE",) * 10 + ("IMAGE",)
+    RETURN_NAMES = tuple(f"输出_{i}" for i in range(1, 11)) + ("所有成功图像",)
     FUNCTION = "generate"
     CATEGORY = "影客AI"
 
@@ -354,27 +362,36 @@ class RunningHubRhartImageToImageBatch10:
         print(f"❌ [组 {group_id} 变体 {var_id}] 所有 {total_attempt} 次尝试均失败", flush=True)
         return None
 
-    def process_single_group_with_batch(self, group_id, image_tensors, prompt, batch_count,
+    def process_single_group_with_batch(self, group_id, image_tensors, prompt_list, batch_count,
                                        runninghub_api_key, banana_api_key,
                                        image_hosting, creds,
                                        resolution, aspect_ratio, max_wait_time,
-                                       global_max_workers, strategy):
+                                       strategy):
         image_urls = []
         hosting_name = "ImgBB" if image_hosting == "ImgBB" else "阿里云 OSS"
         print(f"[组 {group_id}] 正在上传 {len(image_tensors)} 张参考图到 {hosting_name}...", flush=True)
         for idx, tensor in enumerate(image_tensors[:5], 1):
-            pil_img = self.tensor_to_pil(tensor)
-            url = self.upload_image(pil_img, image_hosting, **creds)
-            image_urls.append(url)
-            print(f"[组 {group_id}] 参考图 {idx} 上传成功: {url}", flush=True)
+            try:
+                pil_img = self.tensor_to_pil(tensor)
+                url = self.upload_image(pil_img, image_hosting, **creds)
+                image_urls.append(url)
+                print(f"[组 {group_id}] 参考图 {idx} 上传成功: {url}", flush=True)
+            except Exception as e:
+                print(f"[组 {group_id}] 跳过无效图像 {idx}: {e}", flush=True)
+                continue
+
+        if not image_urls:
+            raise RuntimeError(f"[组 {group_id}] 无有效参考图可上传")
+
         print(f"[组 {group_id}] 参考图全部上传完成，开始生成 {batch_count} 个变体", flush=True)
 
         successful_results = []
-        with ThreadPoolExecutor(max_workers=min(batch_count, global_max_workers)) as executor:
+        with ThreadPoolExecutor(max_workers=batch_count) as executor:
             futures = [
                 executor.submit(
                     self._attempt_with_strategy,
-                    group_id, var_index + 1, image_urls, prompt,
+                    group_id, var_index + 1, image_urls,
+                    prompt_list[min(var_index, len(prompt_list) - 1)],
                     runninghub_api_key, banana_api_key,
                     resolution, aspect_ratio, max_wait_time,
                     strategy
@@ -386,15 +403,31 @@ class RunningHubRhartImageToImageBatch10:
                     result = future.result()
                     if result is not None:
                         successful_results.append(self.pil_to_tensor(result))
-                except:
-                    pass
+                except Exception as e:
+                    print(f"⚠️ [组 {group_id}] 某变体执行异常（已跳过）: {e}", flush=True)
 
-        if successful_results:
-            print(f"[组 {group_id}] 成功生成 {len(successful_results)} / {batch_count} 个变体", flush=True)
-            return torch.cat(successful_results, dim=0)
-        else:
+        if not successful_results:
             print(f"[组 {group_id}] 所有变体均失败", flush=True)
             return torch.zeros((1, 64, 64, 3), dtype=torch.float32)
+
+        # 统一尺寸以避免拼接失败（仅针对输出图）
+        try:
+            first_tensor = successful_results[0]
+            _, H, W, C = first_tensor.shape
+            aligned_tensors = [first_tensor]
+            for i in range(1, len(successful_results)):
+                t = successful_results[i]
+                if t.shape[1:] != (H, W, C):
+                    pil_img = self.tensor_to_pil(t)
+                    resized_pil = pil_img.resize((W, H), Image.LANCZOS)
+                    t = self.pil_to_tensor(resized_pil)
+                aligned_tensors.append(t)
+            final_output = torch.cat(aligned_tensors, dim=0)
+            print(f"[组 {group_id}] 成功生成并合并 {len(aligned_tensors)} / {batch_count} 个变体", flush=True)
+            return final_output
+        except Exception as e:
+            print(f"❌ [组 {group_id}] 合并成功图像时出错，返回单张: {e}", flush=True)
+            return successful_results[0]
 
     def generate(self,
                  社区版_最大尝试次数,
@@ -404,16 +437,16 @@ class RunningHubRhartImageToImageBatch10:
                  image_hosting,
                  imgbb_api_key,
                  oss_access_key_id, oss_access_key_secret, oss_bucket_name, oss_endpoint,
-                 resolution, aspect_ratio, seed, global_concurrent_tasks, max_wait_time, **kwargs):
+                 resolution, aspect_ratio, seed, global_concurrent_tasks, max_wait_time,
+                 max_prompt_lines_global,
+                 **kwargs):
 
-        # === 构建策略：固定顺序（社区 → 全能Xinbao → 官方）===
         strategy = self._build_strategy_from_attempts(
             int(社区版_最大尝试次数),
             int(全能Xinbao_最大尝试次数),
             int(官方PRO版_最大尝试次数)
         )
 
-        # === 密钥校验 ===
         need_runninghub = any(step["type"] in ["community", "official"] for step in strategy)
         need_xinbao = any(step["type"] == "xinbao" for step in strategy)
 
@@ -422,7 +455,6 @@ class RunningHubRhartImageToImageBatch10:
         if need_xinbao and not 全能Xinbao_api_key.strip():
             raise ValueError("当前策略包含「全能Xinbao」，请填写其 API 密钥")
 
-        # === 图床校验 ===
         creds = {
             "imgbb_api_key": imgbb_api_key,
             "oss_access_key_id": oss_access_key_id,
@@ -442,48 +474,66 @@ class RunningHubRhartImageToImageBatch10:
 
         global_concurrent_tasks = min(max(1, int(global_concurrent_tasks)), 10)
         max_wait_time = min(max(30, int(max_wait_time)), 600)
+        
+        max_prompt_lines_global = int(max_prompt_lines_global)
+        if max_prompt_lines_global == 0:
+            max_prompt_lines_global = -1
 
-        placeholder = torch.zeros((1, 64, 64, 3), dtype=torch.float32)
-        results = [placeholder] * 10
+        skipped_placeholder = torch.zeros((1, 1, 1, 3), dtype=torch.float32)
+        results = [skipped_placeholder] * 10
 
-        tasks = []
+        valid_tasks = []
         for i in range(1, 11):
-            prompt_val = kwargs.get(f"prompt_{i}", "").strip()
-            batch_count = int(kwargs.get(f"batch_count_{i}", 1))
-            batch_count = max(1, min(10, batch_count))
+            raw_prompt = kwargs.get(f"prompt_{i}", "")
+            prompt_lines = [line.strip() for line in raw_prompt.split('\n') if line.strip()]
+            if not prompt_lines:
+                continue
 
-            images_i = []
+            if max_prompt_lines_global > 0 and len(prompt_lines) > max_prompt_lines_global:
+                original_len = len(prompt_lines)
+                prompt_lines = prompt_lines[:max_prompt_lines_global]
+                print(f"[组 {i}] 提示词行数被全局限制为 {len(prompt_lines)} 行（max_prompt_lines_global={max_prompt_lines_global}）", flush=True)
+
+            # ✅ 关键修改：不再拼接 tensor，而是收集原始 tensor 列表
+            image_tensors = []
             group_letter = chr(ord('A') + i - 1)
             for suffix in ['a', 'b', 'c']:
                 img = kwargs.get(f"image_{group_letter}_{suffix}")
                 if img is not None and img.shape[0] > 0:
-                    images_i.append(img)
+                    # 支持 batch 输入（如 LoadImage 输出可能是 [N,H,W,C]）
+                    for b in range(img.shape[0]):
+                        image_tensors.append(img[b:b+1])  # 保持 [1,H,W,C] 格式
 
-            if images_i and prompt_val:
-                combined = torch.cat(images_i, dim=0)
-                tasks.append((i, combined, prompt_val, batch_count))
+            if not image_tensors:
+                continue
+
+            # ✅ 根据实际 prompt_lines 决定 batch_count
+            if len(prompt_lines) > 1:
+                effective_batch_count = len(prompt_lines)
             else:
-                tasks.append(None)
+                user_batch = int(kwargs.get(f"batch_count_{i}", 1))
+                effective_batch_count = max(1, min(10, user_batch))
 
-        if not any(tasks):
+            valid_tasks.append((i - 1, i, image_tensors, prompt_lines, effective_batch_count))
+
+        if not valid_tasks:
             raise ValueError("至少需要一组有效的（提示词 + 至少1张参考图）")
 
-        with ThreadPoolExecutor(max_workers=global_concurrent_tasks) as executor:
+        valid_tasks = valid_tasks[:global_concurrent_tasks]
+        print(f"▶ 仅处理前 {len(valid_tasks)} 个有效组（受 global_concurrent_tasks={global_concurrent_tasks} 限制）", flush=True)
+
+        with ThreadPoolExecutor(max_workers=len(valid_tasks)) as executor:
             futures = {}
-            for idx, task in enumerate(tasks):
-                if task is None:
-                    continue
-                group_id, images, prompt, batch_count = task
+            for out_idx, group_id, image_tensors, prompt_lines, batch_count in valid_tasks:
                 future = executor.submit(
                     self.process_single_group_with_batch,
-                    group_id, images, prompt, batch_count,
+                    group_id, image_tensors, prompt_lines, batch_count,
                     runninghub_api_key, 全能Xinbao_api_key,
                     image_hosting, creds,
                     resolution, aspect_ratio, max_wait_time,
-                    global_concurrent_tasks,
                     strategy
                 )
-                futures[future] = idx
+                futures[future] = out_idx
 
             for future in as_completed(futures):
                 out_idx = futures[future]
@@ -492,7 +542,18 @@ class RunningHubRhartImageToImageBatch10:
                 except Exception as e:
                     print(f"⚠️ 组 {out_idx + 1} 整体失败: {e}", flush=True)
 
-        return tuple(results)
+        # 汇总所有真实成功图像
+        all_real_images = []
+        for img_tensor in results:
+            if img_tensor.shape[1] > 64:  # 排除占位符
+                all_real_images.append(img_tensor)
+
+        if all_real_images:
+            all_success_output = torch.cat(all_real_images, dim=0)
+        else:
+            all_success_output = torch.zeros((1, 1, 1, 3), dtype=torch.float32)
+
+        return tuple(results) + (all_success_output,)
 
 
 NODE_CLASS_MAPPINGS = {
